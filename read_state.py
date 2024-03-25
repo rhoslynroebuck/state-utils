@@ -36,6 +36,10 @@ Example when used as a script:
     # show the timestamps and full state in human-readable form
     python read_state.py --full --pretty my_file.state
 
+Recording files written using Narupa may contain the string "narupa" in some
+state update keys. Using the `--narupa` keyword of the `read_state.py` command
+line writes a new file with the occurence of "narupa" by "nanover".
+
 """
 
 import argparse
