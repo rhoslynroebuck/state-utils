@@ -39,16 +39,31 @@ Example when used as a script:
 """
 
 import argparse
+from typing import Any
+from pathlib import Path
 from pprint import pprint
 from nanover.mdanalysis import recordings
 from nanover.protocol.state import StateUpdate
 from nanover.utilities.protobuf_utilities import struct_to_dict
 
 
-def iter_state_updates(unpacker: recordings.Unpacker):
-    """
-    Read a binary stream and yield the state updates and their timestamps.
-    """
+class Header:
+    magic_number: int
+    format_version: int
+
+    def __init__(self, magic_number, format_version):
+        self.magic_number = magic_number
+        self.format_version = format_version
+
+    def as_bytes(self) -> bytes:
+        magic_number_bytes = self.magic_number.to_bytes(
+            8, 'little', signed=False)
+        format_version_bytes = self.format_version.to_bytes(
+            8, 'little', signed=False)
+        return magic_number_bytes + format_version_bytes
+
+
+def read_header(unpacker: recordings.Unpacker) -> Header:
     supported_format_versions = (2,)
     magic_number = unpacker.unpack_u64()
     if magic_number != recordings.MAGIC_NUMBER:
@@ -57,6 +72,13 @@ def iter_state_updates(unpacker: recordings.Unpacker):
     if format_version not in supported_format_versions:
         raise recordings.UnsuportedFormatVersion(
             format_version, supported_format_versions)
+    return Header(magic_number, format_version)
+
+
+def iter_state_updates(unpacker: recordings.Unpacker, _header: Header):
+    """
+    Read a binary stream and yield the state updates and their timestamps.
+    """
     while True:
         try:
             elapsed = unpacker.unpack_u128()
@@ -96,7 +118,54 @@ def iter_state_file(path):
     with open(path, "rb") as infile:
         data = infile.read()
     unpacker = recordings.Unpacker(data)
-    yield from iter_state_updates(unpacker)
+    header = read_header(unpacker)
+    yield from iter_state_updates(unpacker, header)
+
+
+def copy_header(unpacker, writer) -> Header:
+    header = read_header(unpacker)
+    writer.write(header.as_bytes())
+    return header
+
+
+def recursive_replace(value, to_replace, replace_by):
+    if not isinstance(value, dict):
+        return value
+
+    return {
+        key.replace(to_replace, replace_by): recursive_replace(value, to_replace, replace_by)
+        for key, value
+        in value.items()
+    }
+
+
+def replace_and_copy_records(unpacker, writer, header, to_replace, replace_by):
+    for timestamp, update in iter_state_updates(unpacker, header):
+        new_update_dict = {
+            key.replace(to_replace, replace_by): recursive_replace(value, to_replace, replace_by)
+            for key, value
+            in update.items()
+        }
+        writer.write(state_record_as_bytes(timestamp, new_update_dict))
+
+
+def state_record_as_bytes(
+    timestamp: int, update_dict: dict[str, Any]
+) -> bytes:
+    update = StateUpdate()
+    update.changed_keys.update(update_dict)
+    update_bytes = update.SerializeToString()
+    length_bytes = len(update_bytes).to_bytes(8, 'little', signed=False)
+    timestamp_bytes = timestamp.to_bytes(16, 'little', signed=False)
+    return timestamp_bytes + length_bytes + update_bytes
+
+
+def replace_narupa(unpacker: recordings.Unpacker, writer):
+    """
+    Replace every ocurence of `narupa` to `nanover` in key names.
+    """
+    header = copy_header(unpacker, writer)
+    replace_and_copy_records(unpacker, writer, header, 'narupa', 'nanover')
 
 
 def command_line():
@@ -109,19 +178,29 @@ def command_line():
         '--pretty', action='store_true', default=False,
         help='Display the state in a more human-readable way.'
     )
+    parser.add_argument(
+        '--narupa', type=Path, default=None,
+        help='Write a new file where "narupa" is replaced by "nanover" in all keys.'
+    )
     parser.add_argument('path', help='Path to the file to read.')
     args = parser.parse_args()
 
-    stream = iter_state_file(args.path)
-    if args.full:
-        stream = iter_full_states(stream)
+    if args.narupa is not None:
+        with open(args.path, 'rb') as input_file:
+            unpacker = recordings.Unpacker(input_file.read())
+        with open(args.narupa, 'wb') as writer:
+            replace_narupa(unpacker, writer)
+    else:
+        stream = iter_state_file(args.path)
+        if args.full:
+            stream = iter_full_states(stream)
 
-    for update in stream:
-        if args.pretty:
-            print(f'---- {update[0]} ---------')
-            pprint(update[1])
-        else:
-            print(update)
+        for update in stream:
+            if args.pretty:
+                print(f'---- {update[0]} ---------')
+                pprint(update[1])
+            else:
+                print(update)
 
 
 if __name__ == '__main__':
